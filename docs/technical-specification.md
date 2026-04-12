@@ -44,3 +44,56 @@ RetailPulse is a cloud-native data lakehouse platform built on GCP that ingests,
 - ML model training is out of scope - Data will be used for Business report and to calculate churn and LTV modelling
 - Multi store WooCommerce support is out of scope - v1 is designed for a single store instance; multi-tenancy adds schema and auth complexity that is not required for the current use case
 - Self-serve BI dashboard development is out of scope - RetailPulse serves clean data to BigQuery; dashboard design and maintenance is owned by the Data Analyst team
+
+## Section 3: Architecture Overview
+
+### Narrative
+The data flows through REST API from WooCommerce platform to GCP and landing area is the GCS buckets where it gets stored in raw form. In parallel, WooCommerce webhooks capture real-time change event, order updates and customer modifications, which are consumed as CDC events and landed in GCS before flowing through the same Bronze/Silver/Gold pipeline. Dataproc writes cleaned data back to GCS as the silver layer and loads curated data into BigQuery as the gold layer. Inside BigQuery, Dataform models the curated data into Star schema, Data Vault 2.0 and OBT structures which are then consumed by Power BI for business reporting. The whole pipeline is orchestrated by Cloud Composer.
+
+### Layer definition
+|-----------------------------------------------------------------------------------------------------------------------|
+|  Layer  |  Location  |  Format  |  GCP Services  |                    Purpose                                         |
+|---------|------------|----------|----------------|--------------------------------------------------------------------|
+| Bronze  | GCS        | Parquet  |  Dataproc      | Landing of raw data for back-up and further transformation         |
+| Silver  | GCS        | ORC      |  Dataproc      | Cleansed, conformed and historised data. SCD Type 1 applied to     |
+|         |            |          |                | dim_products, SCD Type 2 applied to dim_customers. Schema evolution|
+|         |            |          |                | handled here. Data quality check enforced before promotion         |
+| Gold    | BigQuery   | Columnar |  Dataform      | Analytics ready, modelled datasets serving Star Schema, Data Vault |
+|         |            |          |                | 2.0 and OBT structure. Optimized with partitioning and clustering  |
+|         |            |          |                | for query performance                                              |
+|-----------------------------------------------------------------------------------------------------------------------|
+
+### GCP services used
+|-----------------------------------------------------------------------------------------------------------------------  |
+| Service       |  Role in RetailPulse                     | Why this service                                             |
+|-----------------------------------------------------------------------------------------------------------------------  |
+| GCS           | It stores raw data and CDC data coming    |This is a cost optimised service which provides raw backup   |
+|               | from WooCommerce REST API and Webhooks    |with very minimal cost of storage                            |
+| Dataproc      | It runs Pyspark jobs for Bronze ingestion,|Managed spark service on GCP, no cluster setup or            |
+|               | Silver transformation, SCD processing,    |maintenance needed. Integrates natively with GCS and BigQuery|
+|               |                                           |Cost effective as cluster spins up only when a job runs      |
+| BigQuery      | It stores transformed and curated datasets|An efficient warehousing service which not only stores       |
+|               | for modelling and business reporting      |curated data in form of table/views but also enable user to  |
+|               |                                           |querying data by writing SQL                                 |
+| Dataform      | used for data modelling/ELT on stored data|It gives a flexibility to user to perform ELT and data       |
+|               | in BigQuery                               |modelling on curated datasets and then fulfill the           |
+|               |                                           |purpose such as business reporting and ML model training     |
+| Cloud Composer| It's used for pipeline orchestration      |supports Airflow DAGs to orchestrate the full pipeline       |
+|               |                                           |ensuring execution orders, automatic retries on failure      |
+|               |                                           |and alerting when something goes wrong                       | 
+|-----------------------------------------------------------------------------------------------------------------------  |
+
+### Tools used alongside GCP
+
+|-----------------------------------------------------------------------------------------------------------------------|
+| Tools              | Purpose                                                                                          |
+|-----------------------------------------------------------------------------------------------------------------------|
+| Great Expectations |  It's Python library which checks the data quality while data movement from bronze to silver     |
+| Evidently AI       |  It's Python library for data drift detection which compares data today against data from        |
+|                    |  previous period and tell if something unexpected has changed                                    |
+| Delta Lake         |  It's an Open table format for schema evolution in GCS                                           |
+| pytest             |  It's used to write unit testing for all pipeline code                                           |
+| Power BI           |  It consumes curated data for business reporting                                                 |
+| GitHub Actions     |  Runs automated pytest suite on every push to develop branch. Blocks merge if any test fails     |
+|                    |  ensuring code quality is maintained throughout development                                      |
+|-----------------------------------------------------------------------------------------------------------------------|
