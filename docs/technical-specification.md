@@ -97,3 +97,147 @@ The data flows through REST API from WooCommerce platform to GCP and landing are
 | GitHub Actions     |  Runs automated pytest suite on every push to develop branch. Blocks merge if any test fails     |
 |                    |  ensuring code quality is maintained throughout development                                      |
 |-----------------------------------------------------------------------------------------------------------------------|
+
+## Section 4: API Contract
+
+### Authentication
+
+**Mechanism:** 
+The data pipeline authenticate with WooCommerece in two different ways:
+- https query parameters: WooCommerce REST API uses Consumer key and Consumer secret, two long string that act like username and password.
+   Both of them are passed in URL and can appear in logs.(less secure and preferred in development) 
+- OAuth 1.0a: This mechanism signs every request with a cryptographic signature using consumer key and secret. The credentials themselves never 
+   travels in URL, only signature does. WooCommerce get that signature varified on server side.(More secured and preferred for production)
+
+**Credentials storage:** 
+Credentials are stored in a .env file and read at runtime using python-dotenv. The .env file is added to .gitignore and never committed to GitHub. 
+The .env.example file serves as a template showing required variables without exposing real values.
+
+**Error Handling:** 
+A HTTP 401 response indicates invalid or expired credentials. 
+The pipeline will raise an authentication exception and halt — no partial data will be written to GCS.
+
+### Pagination strategy
+
+WooCommerce returns 10 items per page by default and the threshold can go upto 100 records per request. In HTTP headers, total number of resource and 
+pages are always included in the X-WP-Total and X-WP-TotalPages and accordingly retrival of complete records can be set up in below parameters which
+controls pagination.
+- GET /orders?per_page = 15 (item per page can be specified with ?per_page parameter)
+- GET /orders?page = 2 (further pages can be specified  with ?page parameter)
+- GET /orders?offset = 5 (offset from first resource can be specified using offset parameter)
+
+### Rate limiting
+
+WooCommerce itself doesn't enforce rate limits at the application level. However the pipeline uses a combine strategy of Proactive Throttling and exponential 
+back off to ensure compatibility with the production hosting environment which typically enforces 60-120 requests per minute.
+
+**Strategy:**
+- Primary: throttle to one request per second between paginated API calls
+- Fallback: exponential back off on http 429 responses, statring from 1 second wait time to doubling down to 16 seconds wait time
+- Maximum: 5 retries before raising an alert to airflow
+
+
+### Incremental loading strategy
+
+The date_modified field is used as the pipeline watermark. 
+On each run the pipeline passes ?after=last_successful_run_timestamp to fetch only records modified since the last successful ingestion. 
+The watermark timestamp is stored in GCS as a small JSON file and updated after each successful run. 
+On first run a full historical load is performed.
+
+### Endpoints and fields extracted
+
+#### Orders endpoint
+
+| Field | API path | Data type | Nullable | PII | Notes |
+|-------|----------|-----------|----------|-----|-------|
+| order_id | id | INTEGER | No | No | Primary key |
+| order_status | status | STRING | No | No | analytics (order funnel analysis) |
+| order_placed_date | date_created | TIMESTAMP | No | No | analytics (when order placed) |
+| order_update_date | date_modified | TIMESTAMP | No | No  | pipeline logic (CDC watermark) |
+| customer_id | customer_id | INTEGER | No | No | analytics + pipeline (SCD 2 Join Key) |
+| total | total | STRING  | No | No | analytics (revenue) |
+| subtotal | subtotal | STRING | No | No | analytics |
+| currency | currency | STRING | No | No | analytics |
+| total_discount_provided | discount_total | STRING | Yes | No  | analytics |
+| billing_email | billing.email | STRING | Yes  | Yes | PII (mask in silver layer) |
+| billing_phone | billing.phone | STRING | Yes  | Yes | PII (mask in silver layer) |
+| billing_first_name | billing.first_name | STRING | No | Yes | PII (mask in silver layer) |
+| billing_last_name | billing.last_name | STRING | No | Yes | PII (mask in silver layer) |
+| billing_city | billing.city | STRING | Yes | No | analytics (regional reporting) |
+| billing_state | billing.state | STRING | No | No | analytics (regional reporting) |
+| billing_country | billing.country | STRING | No | No | analytics (regional reporting) |
+| line_items_id | line_items[].id | INTEGER | No | No | pipeline logic |
+| line_items_product_id | line_items[].product_id | INTEGER | No | No | analytics (product performance) |
+| line_items_quantity | line_items[].quantity | INTEGER | Yes | No | analytics (unit sold) | 
+| line_items_total |line_items[].total | STRING | No | No | analytics (line revenue) |
+
+#### Customers endpoint
+
+| Field | API path | Data type | Nullable | PII | Notes |
+|-------|----------|-----------|----------|-----|-------|
+| customer_id | id | INTEGER | No | No | Primary Key |
+| account_created_date | date_created | TIMESTAMP | Yes | No | Account creation date |
+| account_modification_date | date_modified | TIMESTAMP | Yes | No | Account modification date |
+| customer_email | email | STRING | No | Yes | PII (mask in silver layer) |
+| customer_firstname | first_name | STRING | No | Yes | PII (mask in silver layer) |
+| customer_lastname | last_name | STRING | No | Yes | PII (mask in silver layer) |
+| billing_email | billing.email | STRING | Yes  | Yes | PII (mask in silver layer) |
+| billing_phone | billing.phone | STRING | Yes  | Yes | PII (mask in silver layer) |
+| billing_first_name | billing.first_name | STRING | No | Yes | PII (mask in silver layer) |
+| billing_last_name | billing.last_name | STRING | No | Yes | PII (mask in silver layer) |
+| billing_city | billing.city | STRING | Yes | No | analytics (regional reporting) |
+| billing_state | billing.state | STRING | No | No | analytics (regional reporting) |
+| billing_country | billing.country | STRING | No | No | analytics (regional reporting) |
+| shipping_first_name | shipping.first_name | STRING | No | Yes | PII (mask in silver layer) |
+| shipping_last_name | shipping.last_name | STRING | No | Yes | PII (mask in silver layer) |
+| shipping_city | shipping.city | STRING | Yes | No | analytics (regional reporting) |
+| shipping_state | shipping.state | STRING | No | No | analytics (regional reporting) |
+| shipping_country | shipping.country | STRING | No | No | analytics (regional reporting) |
+| customer_type | is_paying_customer | BOOLEAN | No | No | analytics (distinguishes paying customers from registered non-buyers) |
+
+
+#### Products endpoint
+
+| Field | API path | Data type | Nullable | PII | Notes |
+|-------|----------|-----------|----------|-----|-------|
+| product_id | id | INTEGER | No | No | product identification (Primary Key) |
+| product_name | name | STRING | No | No | analytics (products available in stock) |
+| product_added_date | date_created | STRING | No | No | analytics (when product got added) |
+| product_modification_date | date_modified | STRING | No | No | analytics (change in product stock) |
+| product_type | type | STRING | No | No | simple/variable product distinction |
+| product_status | status | STRING | No | No | publish/draft/private for filtering |
+| stock_keeping_unit | sku | STRING | No | No | stock keeping unit, used in inventory |
+| product_price | price | STRING | No | No | analytics (cast to decimal in silver layer) |
+| product_original_price | regular_price | STRING | No | No | analytics(original price) |
+| product_discounted_price | sale_price | STRING | Yes | No | analytics (discount tracking) |
+| sale_start_date | date_on_sale_from | DATETIME | Yes | No | analytics (promotion tracking) |
+| sale_end_date | date_on_sale_to | DATETIME | Yes | No | analytics (promotion tracking) |
+| product_on_sale | on_sale | BOOLEAN | No | No | quick filter tag |
+| total_sales_value | total_sales | INTEGER | No | No | analytics (product popularity) |
+| manage_stock    | manage_stock      | BOOLEAN  | No  | No | pipeline logic |
+| stock_quantity  | stock_quantity    | INTEGER  | Yes | No | null when unmanaged |
+| stock_status    | stock_status      | STRING   | No  | No | instock/outofstock |
+| average_rating  | average_rating    | DECIMAL  | No  | No | product quality signal |
+| rating_count    | rating_count      | INTEGER  | No  | No | review volume |
+| parent_id       | parent_id         | INTEGER  | No  | No | variant products |
+| category_id     | categories[].id   | INTEGER  | No  | No | category reporting |
+| category_name   | categories[].name | STRING   | No  | No | category reporting |
+
+
+### Known quirks
+
+1. All monetary fields return as strings — must cast to DECIMAL
+2. line_items is a nested array — must explode in Silver not Bronze
+3. customer_id = 0 for guest orders — map to -1 unknown member
+4. date_modified updates on system touches — combine with 
+   event_type for reliable CDC
+5. sale_price returns as empty string "" when product is not on sale — must treat empty string as null before casting to DECIMAL
+
+### Webhook events
+
+| Event | Trigger | Payload fields used |
+|-------|---------|---------------------|
+| woocommerce_new_order | New order placed | id, status, customer_id, total, line_items |
+| woocommerce_order_status_changed | Order status update | id, status, date_modified |
+| woocommerce_customer_created | New customer registered | id, email, billing |
+| woocommerce_product_updated | Product details changed | id, name, price, stock_status |
