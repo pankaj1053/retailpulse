@@ -241,3 +241,96 @@ On first run a full historical load is performed.
 | woocommerce_order_status_changed | Order status update | id, status, date_modified |
 | woocommerce_customer_created | New customer registered | id, email, billing |
 | woocommerce_product_updated | Product details changed | id, name, price, stock_status |
+
+## Section 5: Data Models
+
+### Why data modelling is needed
+
+Raw WooCommerce data is designed for transactional operations — fast individual writes optimised for a web store. 
+It cannot be used directly for analytics because it contains nested JSON structures that cannot be aggregated, 
+monetary values stored as strings that cannot be summed, no historical tracking of how records change over time, 
+and no enforced relationships between orders, customers and products. 
+Data modelling restructures this transactional data into analytics-optimised structures with defined facts, dimensions and relationships.
+
+
+### Model 1 — Star Schema
+
+**Purpose:** 
+Star schema is the primary analytical model for RetailPulse. 
+It separates measurable order events (fact_orders) from descriptive context (dim_customers, dim_products, dim_date) 
+enabling fast aggregations and simple joins. Chosen as the primary model because Power BI integrates natively with 
+Star schema and all RetailPulse reporting requirements can be satisfied with this structure.
+
+**Tables:**
+- fact_orders: order_id, customer_id, product_id, date_id, order_status_id, quantity, unit_price, line_total, discount_amount, order_total, currency. 
+              Contains foreign keys to all dimensions and measurable numeric values only.
+- dim_customers: It contains descriptive attributes such as customer's name, email id, phone, username, account creation date along with primary key as customer id.
+- dim_products: It contains descriptive attributes of products such as product's name, category, product type, product price, sku along with primary key as product id.
+- dim_date: It contains date_id, date, day, week, month, quarter, year. It consists date from 2020 to 2030 pre-generated. The 'quarter' attribute allows sales by quarter without extracting timestamp.
+
+**Used for:** Star schema is used by BI developers for making dashboard on Power BI since it complies really well with Star Schema. Also, while applying joins operations between fact and dimension.
+
+
+### Model 2 — Data Vault 2.0
+
+**Purpose:** Data Vault 2.0 is implemented as a secondary model to demonstrate architectural breadth. 
+For a single-store WooCommerce deployment, Star schema alone would satisfy all requirements. 
+Data Vault would be the primary choice if RetailPulse scaled to multiple source systems or required regulatory audit compliance.
+
+**Hubs:**  
+hub_customers  ← business key: customer_id
+hub_products   ← business key: product_id  
+hub_orders     ← business key: order_id
+
+**Links:** link_order_customer <- connect hub_order + hub_customer, link_order_product <- connect hub_order + hub_product
+
+**Satellites:** 
+sat_customer_details: customer_firstname, customer_lastname, customer_email, customer_type
+sat_order_details: order_status, total_sales_value
+sat_product_details: product_name, product_price, product_type
+**Used for:** It is used by auditors and compliance team
+
+### Model 3 — OBT (One Big Table)
+
+**Purpose:** When there is requirement for ad-hoc analytics  then OBT is used. Since it holds all the attributes in one big
+             flat table which makes it easier to run tools like spark sql or presto and remove the uses of complex joins
+
+**Table:** orders_obt — [
+order_id, order_date, order_status, order_total,
+customer_id, customer_name, customer_city, customer_country,
+product_id, product_name, product_category, product_price,
+line_item_quantity, line_item_total,
+year, month, quarter, week]
+
+**Used for:** Data Scientists preparing ML features and ad-hoc exploratory analysis. Analysts use Star schema for standard reporting. 
+Data Scientists use OBT when they need all attributes in one place for feature engineering without writing complex joins..
+
+### Model comparison
+
+| Criteria                | Star Schema | Data Vault 2.0 | OBT      |
+|-------------------------|-------------|----------------|----------|
+| Query complexity        | Medium      | High           | Low      |
+| Storage efficiency      | High        | Medium         | Low      |
+| Source change resilience| Low         | High           | Low      |
+| BI tool compatibility   | Excellent   | Poor           | Good     |
+| History tracking        | SCD only    | Full audit     | None     |
+| Query performance       | Fast        | Slow           | Fastest  |
+| Scalability             | Medium      | High           | Low      |
+| Best used at            | Most companies | Banks/Telecoms | Meta/Google |
+
+
+### Decision log
+
+[Why did you choose Star schema for Power BI?
+Well modeled fact and dimension table are seperated with Primary and foreign key segmentation which helps in creating business level metrics.
+
+Why did you implement Data Vault?
+In case of introducing new attributes in customer, products and orders, data vault helps to scale in optimized way as well as helps to apply SCD2 for storing historical records.
+
+Why did you include OBT?
+OBT stores every attribute of orders, products and customers. Although it holds more number of rows and columns but it helps avoid complex joins as well
+as help in ad-hoc analysis.
+
+All three models are implemented to demonstrate architectural breadth across modelling paradigms. In a production single-store deployment, 
+Star schema alone would be the pragmatic choice
+]
